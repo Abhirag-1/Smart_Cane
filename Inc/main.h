@@ -132,8 +132,9 @@ extern "C" {
 #define SOS_CANCEL_WINDOW_MS  (5000U)     /* 5-second window for False Alarm cancel */
 #define MOMENTARY_HOLD_MIN_MS (350U)      /* Threshold to distinguish latch vs tap */
 #define BTN_DEBOUNCE_MS       (50U)       /* 50 ms button debounce */
+#define GPS_JUMP_THRESHOLD_TENTHS (10U)   /* Jump filter: 10 tenths (~1.85 km in 5s) */
 
-#define DISTANCE_ALERT_MAX_CM (50U)       /* Alert if distance < 50 cm */
+#define DISTANCE_ALERT_MAX_CM (50U)       /* Alert if distance <= 50 cm */
 #define DISTANCE_ALERT_MIN_CM (2U)        /* Blind zone threshold (2 cm) */
 
 /* System States -------------------------------------------------------------*/
@@ -144,16 +145,16 @@ typedef enum {
 } EmergencyState_t;
 
 typedef enum {
-  GPS_STATE_IDLE        = 0,      /* Waiting for 5s timer trigger */
+  GPS_STATE_IDLE      = 0,        /* Waiting for 5s timer trigger */
   GPS_STATE_WAIT_DOLLAR = 1,      /* Looking for start-of-sentence '$' */
-  GPS_STATE_BUFFERING   = 2       /* Buffering characters until '\n' */
+  GPS_STATE_BUFFERING = 2         /* Buffering characters until '\n' */
 } GpsState_t;
 
 /* String Banners ------------------------------------------------------------*/
 #define STR_BANNER \
   "\r\n=== STM32 GPS (Parsed Lat/Lon) & Ultrasonic Ready ===\r\n" \
   "[GPS]: 5-sec interval (Parsed)\r\n" \
-  "[Ultrasonic]: Alert if < 50 cm\r\n" \
+  "[Ultrasonic]: Alert if <= 50 cm\r\n" \
   "[Emergency]: PB1 Button (Push 2x < 5s = False Alarm)\r\n\r\n"
 
 #define STR_SOS_BANNER \
@@ -172,7 +173,10 @@ typedef enum {
   "========================================\r\n\r\n"
 
 #define STR_SOS_CLEARED \
-  "\r\n*** [EMERGENCY CLEARED - NORMAL RESUMED] ***\r\n\r\n"
+  "\r\n========================================\r\n" \
+  "*** [EMERGENCY CLEARED - SOS OFF] ***\r\n" \
+  "*** NORMAL MODE RESUMED ***\r\n" \
+  "========================================\r\n\r\n"
 
 #define STR_SOS_PREFIX \
   "\r\n*** [EMERGENCY GPS LOCATION] ***\r\n"
@@ -185,9 +189,11 @@ typedef enum {
 void System_Init(void);
 void UART2_SendChar(char c);
 void UART2_SendString(const char *str);
+void UART2_SendNum(uint32_t num);
 void UART2_Send2DigitNum(uint32_t num);
 bool Parse_RMC(char *line);
 void Send_Parsed_GPS(void);
+void Filter_And_Send_GPS(void);
 void Process_Emergency_Button(void);
 void Process_GPS_Byte(uint8_t byte);
 void Process_SysTick(void);

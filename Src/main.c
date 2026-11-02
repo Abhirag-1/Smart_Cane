@@ -41,6 +41,16 @@ static char ns_char                         = 'N';
 static char *ptr_lon                        = NULL;
 static char ew_char                         = 'E';
 
+/* Previous Valid GPS Coordinates (Jump/Glitch Filter) -----------------------*/
+static char prev_lat_str[16]                = {0};
+static char prev_ns_char                    = 'N';
+static char prev_lon_str[16]                = {0};
+static char prev_ew_char                    = 'E';
+static volatile uint32_t has_prev_gps       = 0;
+static volatile uint32_t prev_lat_tenths    = 0;
+static volatile uint32_t prev_lon_tenths    = 0;
+static volatile uint32_t gps_glitch_count   = 0;
+
 /* ---------------------------------------------------------------------------*/
 /* Hardware Initialization                                                    */
 /* ---------------------------------------------------------------------------*/
@@ -88,6 +98,8 @@ void System_Init(void) {
     /* 6. TIM2: Prescaler = 7 (1us tick @ 8 MHz), ARR = 0xFFFF */
     TIM2->PSC = 7;
     TIM2->ARR = 0xFFFF;
+    TIM2->EGR = 1;                      /* Force prescaler shadow update (UG bit) */
+    TIM2->SR  = 0;                      /* Clear update interrupt flag */
     TIM2->CR1 = 0;
 
     /* 7. USART1 (NEO-6M GPS @ 9600 baud, 8-N-1) */
@@ -133,13 +145,24 @@ void UART2_SendString(const char *str) {
 }
 
 /**
-  * @brief  Transmits a 2-digit decimal number (00..99) over USART2.
+  * @brief  Transmits a decimal number (0-999) cleanly over USART2.
   */
+void UART2_SendNum(uint32_t num) {
+    bool printed = false;
+    if (num >= 100) {
+        UART2_SendChar((char)('0' + (num / 100)));
+        num %= 100;
+        printed = true;
+    }
+    if (printed || num >= 10) {
+        UART2_SendChar((char)('0' + (num / 10)));
+        num %= 10;
+    }
+    UART2_SendChar((char)('0' + num));
+}
+
 void UART2_Send2DigitNum(uint32_t num) {
-    uint8_t tens = (uint8_t)(num / 10);
-    uint8_t units = (uint8_t)(num % 10);
-    UART2_SendChar((char)('0' + tens));
-    UART2_SendChar((char)('0' + units));
+    UART2_SendNum(num);
 }
 
 /* ---------------------------------------------------------------------------*/
@@ -234,6 +257,91 @@ void Send_Parsed_GPS(void) {
     }
 }
 
+/**
+  * @brief  Converts NMEA latitude "DDMM.M..." string to tenths of a minute.
+  */
+static uint32_t Compute_Lat_Tenths(const char *str) {
+    if (str == NULL || str[4] != '.') return 0;
+    uint32_t deg = (str[0] - '0') * 10 + (str[1] - '0');
+    uint32_t min = (str[2] - '0') * 10 + (str[3] - '0');
+    uint32_t total_min = deg * 60 + min;
+    uint32_t tenths = total_min * 10 + (str[5] - '0');
+    return tenths;
+}
+
+/**
+  * @brief  Converts NMEA longitude "DDDMM.M..." string to tenths of a minute.
+  */
+static uint32_t Compute_Lon_Tenths(const char *str) {
+    if (str == NULL || str[5] != '.') return 0;
+    uint32_t deg = (str[0] - '0') * 100 + (str[1] - '0') * 10 + (str[2] - '0');
+    uint32_t min = (str[3] - '0') * 10 + (str[4] - '0');
+    uint32_t total_min = deg * 60 + min;
+    uint32_t tenths = total_min * 10 + (str[6] - '0');
+    return tenths;
+}
+
+/**
+  * @brief  Filters out large jumps in coordinates. If a jump > 10 tenths (~1.85 km)
+  *         is detected in 5 seconds, sends the previous valid coordinates instead.
+  */
+void Filter_And_Send_GPS(void) {
+    if (gps_status != 'A' || ptr_lat == NULL || ptr_lon == NULL) {
+        Send_Parsed_GPS();
+        return;
+    }
+
+    /* If first fix ever, save as baseline and transmit */
+    if (!has_prev_gps) {
+        has_prev_gps = 1;
+        strncpy(prev_lat_str, ptr_lat, sizeof(prev_lat_str) - 1);
+        prev_ns_char = ns_char;
+        strncpy(prev_lon_str, ptr_lon, sizeof(prev_lon_str) - 1);
+        prev_ew_char = ew_char;
+        prev_lat_tenths = Compute_Lat_Tenths(ptr_lat);
+        prev_lon_tenths = Compute_Lon_Tenths(ptr_lon);
+        Send_Parsed_GPS();
+        return;
+    }
+
+    uint32_t curr_lat_t = Compute_Lat_Tenths(ptr_lat);
+    uint32_t curr_lon_t = Compute_Lon_Tenths(ptr_lon);
+
+    int32_t diff_lat = (int32_t)curr_lat_t - (int32_t)prev_lat_tenths;
+    if (diff_lat < 0) diff_lat = -diff_lat;
+
+    int32_t diff_lon = (int32_t)curr_lon_t - (int32_t)prev_lon_tenths;
+    if (diff_lon < 0) diff_lon = -diff_lon;
+
+    /* Detect jump: hemisphere change or distance diff > 10 tenths (~1.85 km in 5s) */
+    if (ns_char != prev_ns_char || ew_char != prev_ew_char ||
+        diff_lat > (int32_t)GPS_JUMP_THRESHOLD_TENTHS ||
+        diff_lon > (int32_t)GPS_JUMP_THRESHOLD_TENTHS) {
+
+        /* Large jump detected! Increment glitch counter */
+        gps_glitch_count++;
+
+        /* Override transmission pointers with previous valid data */
+        ptr_lat = prev_lat_str;
+        ns_char = prev_ns_char;
+        ptr_lon = prev_lon_str;
+        ew_char = prev_ew_char;
+
+        Send_Parsed_GPS();
+        return;
+    }
+
+    /* Clean coordinate: update baseline */
+    strncpy(prev_lat_str, ptr_lat, sizeof(prev_lat_str) - 1);
+    prev_ns_char = ns_char;
+    strncpy(prev_lon_str, ptr_lon, sizeof(prev_lon_str) - 1);
+    prev_ew_char = ew_char;
+    prev_lat_tenths = curr_lat_t;
+    prev_lon_tenths = curr_lon_t;
+
+    Send_Parsed_GPS();
+}
+
 /* ---------------------------------------------------------------------------*/
 /* Emergency SOS Button State Machine (Universal Latching & Momentary Engine) */
 /* ---------------------------------------------------------------------------*/
@@ -284,7 +392,7 @@ void Process_Emergency_Button(void) {
             UART2_SendString(STR_FALSE_ALARM);
         }
         else if (emergency_state == EMERGENCY_STATE_CONFIRMED) {
-            /* 2ND PUSH AFTER 5 SECONDS -> EMERGENCY CLEARED! */
+            /* 2ND PUSH AFTER 5 SECONDS -> EMERGENCY CLEARED (SOS OFF)! */
             emergency_state = EMERGENCY_STATE_NORMAL;
             emergency_timer_ms = 0;
 
@@ -306,6 +414,7 @@ void Process_Emergency_Button(void) {
             UART2_SendString(STR_FALSE_ALARM);
         }
         else if (emergency_state == EMERGENCY_STATE_CONFIRMED) {
+            /* Latching button unlatched after 5s -> EMERGENCY CLEARED (SOS OFF)! */
             emergency_state = EMERGENCY_STATE_NORMAL;
             emergency_timer_ms = 0;
             UART2_SendString(STR_SOS_CLEARED);
@@ -347,8 +456,8 @@ void Process_GPS_Byte(uint8_t byte) {
             line_buf[line_buf_idx] = '\0'; /* Null-terminate */
 
             if (Parse_RMC(line_buf)) {
-                /* Successfully parsed $GPRMC / $GNRMC: Send formatted Lat/Lon */
-                Send_Parsed_GPS();
+                /* Successfully parsed $GPRMC / $GNRMC: Filter jump & send formatted Lat/Lon */
+                Filter_And_Send_GPS();
                 gps_state = GPS_STATE_IDLE; /* Done, rest until next 5s tick */
             } else {
                 /* Not RMC: continue waiting for next sentence in the 1-second burst */
@@ -445,8 +554,9 @@ void Process_Ultrasonic(void) {
         }
     }
 
-    /* 3. Echo went HIGH: Start TIM2 (1us tick) */
-    TIM2->CNT = 0;
+    /* 3. Echo went HIGH: Cleanly initialize and start TIM2 (1us tick) */
+    TIM2->EGR = 1; /* UG bit: reset counter & prescaler counter to 0 */
+    TIM2->SR  = 0; /* Clear UIF flag */
     TIM2->CR1 = 1; /* CEN = 1 (Enable counter) */
 
     /* 4. Wait for Echo (PA1) to go LOW (Timeout ~45,000 us) */
@@ -468,11 +578,11 @@ void Process_Ultrasonic(void) {
         return;
     }
 
-    /* Distance in cm = microseconds / 58 */
-    distance_cm = raw_echo_us / 58;
+    /* Distance in cm = (microseconds + 29) / 58 (round to nearest cm) */
+    distance_cm = (raw_echo_us + 29) / 58;
 
-    /* Check proximity threshold: 2 cm <= distance < 50 cm */
-    if (distance_cm >= DISTANCE_ALERT_MIN_CM && distance_cm < DISTANCE_ALERT_MAX_CM) {
+    /* Check proximity threshold: 2 cm <= distance <= 50 cm */
+    if (distance_cm >= DISTANCE_ALERT_MIN_CM && distance_cm <= DISTANCE_ALERT_MAX_CM) {
         /* Obstacle Detected: Turn PC13 LED ON (BR13) */
         GPIOC->BSRR = (1 << 29);
 
@@ -515,3 +625,4 @@ int main(void) {
         Process_Ultrasonic();
     }
 }
+
