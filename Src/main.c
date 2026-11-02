@@ -1,573 +1,517 @@
-
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32 Smart Cane - Without MPU6050
-  *
-  * HC-SR04 : PA0 / PA1
-  * Motor   : PB0
-  * Button  : PB1
-  * GPS     : USART1 (PA9 / PA10)
-  * HC-05   : USART2 (PA2 / PA3)
-  * Timer   : TIM2
+  * @brief          : Complete C Implementation of the STM32F103 GPS,
+  *                   Ultrasonic Proximity Alert, and Latching/Momentary
+  *                   Emergency SOS System.
+  * @target         : STM32F103C8T6 (ARM Cortex-M3 @ 8 MHz)
+  * @peripherals    : USART1 (GPS @ 9600), USART2 (HC-05 BT @ 9600),
+  *                   TIM2 (1us Echo Timer), SysTick (1ms System Tick),
+  *                   HC-SR04 (PA0 Trig, PA1 Echo), PB1 Button, PC13 LED.
   ******************************************************************************
   */
-/* USER CODE END Header */
-
-/* Includes ------------------------------------------------------------------*/
 
 #include "main.h"
-#include "tim.h"
-#include "usart.h"
-#include "gpio.h"
 
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
+/* Global Telemetry & System Variables ---------------------------------------*/
+static volatile uint32_t ms_counter         = 0;
+static volatile uint32_t gps_timer          = 0;
+static volatile uint32_t ultrasonic_timer   = 0;
+static volatile uint32_t alert_cooldown     = 0;
 
-/* Private defines -----------------------------------------------------------*/
+static volatile uint32_t emergency_state    = EMERGENCY_STATE_NORMAL;
+static volatile uint32_t emergency_timer_ms = 0;
 
-#define GPS_BUFFER_SIZE          128
+static volatile uint32_t last_btn_level     = 0;
+static volatile uint32_t btn_idle_level     = 0;
+static volatile uint32_t btn_debounce_timer = 0;
+static volatile uint32_t btn_press_duration = 0;
 
-#define OBSTACLE_LIMIT_CM        100.0f
+static volatile uint32_t distance_cm        = 999;
+static volatile uint32_t raw_echo_us        = 0;
 
-#define ULTRASONIC_TIMEOUT_MS    30
+/* GPS Receiver & Parser Variables -------------------------------------------*/
+static volatile uint32_t gps_state          = GPS_STATE_WAIT_DOLLAR; /* Send GPS on boot */
+static char line_buf[128];
+static uint32_t line_buf_idx                = 0;
 
-#define MOTOR_ON_TIME_MS         120
-#define MOTOR_OFF_TIME_MS        400
+static char gps_status                      = 'V';
+static char *ptr_lat                        = NULL;
+static char ns_char                         = 'N';
+static char *ptr_lon                        = NULL;
+static char ew_char                         = 'E';
 
-#define BUTTON_DEBOUNCE_MS       40
+/* ---------------------------------------------------------------------------*/
+/* Hardware Initialization                                                    */
+/* ---------------------------------------------------------------------------*/
 
-/* Private variables ---------------------------------------------------------*/
+/**
+  * @brief  Configures Clocks, GPIOs, SysTick, TIM2, USART1, and USART2.
+  */
+void System_Init(void) {
+    /* 1. Clocks: APB2 (AFIO, IOPA, IOPB, IOPC, USART1) | APB1 (TIM2, USART2) */
+    RCC->APB2ENR = 0x0000401D; /* AFIO(bit 0), IOPA(bit 2), IOPB(bit 3), IOPC(bit 4), USART1(bit 14) */
+    RCC->APB1ENR = 0x00020001; /* TIM2(bit 0), USART2(bit 17) */
 
-/* GPS */
+    /* 2. GPIOA:
+     *    PA0  -> Output Push-Pull 2MHz (CNF=00, MODE=10 -> 0x2) [Trig]
+     *    PA1  -> Input Floating        (CNF=01, MODE=00 -> 0x4) [Echo]
+     *    PA2  -> Alternate Function PP (CNF=10, MODE=11 -> 0xB) [USART2 TX]
+     *    PA3  -> Input with Pull-up    (CNF=10, MODE=00 -> 0x8) [USART2 RX]
+     *    PA9  -> Alternate Function PP (CNF=10, MODE=11 -> 0xB) [USART1 TX]
+     *    PA10 -> Input with Pull-up    (CNF=10, MODE=00 -> 0x8) [USART1 RX]
+     */
+    GPIOA->CRL = 0x44448B42;
+    GPIOA->CRH = 0x444448B4;
+    GPIOA->BSRR = (1 << 3) | (1 << 10); /* Pull-up on PA3 and PA10 */
 
-uint8_t gpsRxByte;
+    /* 3. GPIOB:
+     *    PB1  -> Input with Pull-up    (CNF=10, MODE=00 -> 0x8) [Emergency Button]
+     */
+    GPIOB->CRL = 0x44444484;
+    GPIOB->BSRR = (1 << 1);             /* Set ODR1 = 1 (Internal Pull-Up enabled) */
 
-char gpsBuffer[GPS_BUFFER_SIZE];
-char gpsLine[GPS_BUFFER_SIZE];
+    /* Settle delay for pull-up resistor (~100 us) */
+    for (volatile int i = 0; i < 200; i++) { __NOP(); }
 
-volatile uint16_t gpsIndex = 0;
-volatile uint8_t gpsLineReady = 0;
+    /* 4. GPIOC:
+     *    PC13 -> Output Push-Pull 2MHz (CNF=00, MODE=10 -> 0x2) [Status LED]
+     */
+    GPIOC->CRH = 0x44244444;
+    GPIOC->BSRR = (1 << 13);            /* Turn LED OFF initially (Active-LOW) */
 
-float latitude = 0.0f;
-float longitude = 0.0f;
+    /* 5. SysTick Timer: 1ms tick @ 8 MHz (8000 ticks) */
+    SysTick->LOAD = 7999;
+    SysTick->VAL  = 0;
+    SysTick->CTRL = 5;                  /* CLKSOURCE=1 (CPU), ENABLE=1 */
 
-uint8_t gpsFix = 0;
+    /* 6. TIM2: Prescaler = 7 (1us tick @ 8 MHz), ARR = 0xFFFF */
+    TIM2->PSC = 7;
+    TIM2->ARR = 0xFFFF;
+    TIM2->CR1 = 0;
 
-/* Ultrasonic sensor */
+    /* 7. USART1 (NEO-6M GPS @ 9600 baud, 8-N-1) */
+    USART1->CR1 = 0;
+    USART1->BRR = 0x0341;               /* 8MHz / (16 * 9600) = 52.083 -> 0x0341 */
+    USART1->CR1 = 0x200C;               /* UE=1, TE=1, RE=1 */
 
-float distanceCM = -1.0f;
+    /* 8. USART2 (HC-05 Bluetooth @ 9600 baud, 8-N-1) */
+    USART2->CR1 = 0;
+    USART2->BRR = 0x0341;
+    USART2->CR1 = 0x200C;
 
-uint8_t obstacleDetected = 0;
+    /* 9. Sample initial PB1 button level */
+    uint32_t initial_pin = (GPIOB->IDR >> 1) & 0x01;
+    last_btn_level = initial_pin;
+    btn_idle_level = initial_pin;
 
-uint32_t lastUltrasonicTime = 0;
+    /* Transmit Welcome Banner to Bluetooth */
+    UART2_SendString(STR_BANNER);
+}
 
-/* Motor */
+/* ---------------------------------------------------------------------------*/
+/* UART Helper Functions                                                      */
+/* ---------------------------------------------------------------------------*/
 
-uint8_t motorState = 0;
-
-uint32_t motorTimer = 0;
-
-/* Emergency button */
-
-uint8_t buttonLastReading = 1;
-uint8_t buttonStableState = 1;
-
-uint32_t buttonDebounceTimer = 0;
-
-/* Function prototypes -------------------------------------------------------*/
-
-void SystemClock_Config(void);
-
-static void GPS_StartReception(void);
-static void GPS_ProcessLine(char *line);
-static float GPS_ConvertToDecimal(double coordinate, char direction);
-
-static float Ultrasonic_ReadDistance(void);
-
-static void Motor_Update(void);
-
-static void Button_Process(void);
-
-static void Bluetooth_Send(const char *message);
-static void Send_GPS_Location(const char *alert);
-static void Send_Emergency_Alert(void);
-
-/* Main program --------------------------------------------------------------*/
-
-int main(void)
-{
-    HAL_Init();
-
-    SystemClock_Config();
-
-    /* Initialize peripherals */
-
-    MX_GPIO_Init();
-    MX_TIM2_Init();
-    MX_USART1_UART_Init();
-    MX_USART2_UART_Init();
-
-    /* Start TIM2 */
-
-    if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
-    {
-        Error_Handler();
+/**
+  * @brief  Transmits a single character over USART2 (HC-05).
+  */
+void UART2_SendChar(char c) {
+    while (!(USART2->SR & (1 << 7))) {
+        /* Wait until TXE (Transmit Data Register Empty) */
     }
+    USART2->DR = (uint8_t)c;
+}
 
-    /* Motor OFF at startup */
-
-    MOTOR_OFF();
-
-    /* Start GPS reception */
-
-    GPS_StartReception();
-
-    /* Startup messages */
-
-    Bluetooth_Send("\r\nSMART CANE STARTED\r\n");
-
-    Bluetooth_Send("HC-05 READY\r\n");
-
-    Bluetooth_Send("GPS INITIALIZING\r\n");
-
-    Bluetooth_Send("OBSTACLE DETECTION READY\r\n");
-
-    /* Main loop */
-
-    while (1)
-    {
-        uint32_t currentTime = HAL_GetTick();
-
-        /* ------------------------------------------------
-           1. GPS PROCESSING
-           ------------------------------------------------ */
-
-        if (gpsLineReady)
-        {
-            __disable_irq();
-
-            memcpy(gpsLine, gpsBuffer, GPS_BUFFER_SIZE);
-
-            gpsLineReady = 0;
-            gpsIndex = 0;
-
-            __enable_irq();
-
-            GPS_ProcessLine(gpsLine);
-        }
-
-        /* ------------------------------------------------
-           2. ULTRASONIC SENSOR
-           ------------------------------------------------ */
-
-        if ((currentTime - lastUltrasonicTime) >= 100)
-        {
-            lastUltrasonicTime = currentTime;
-
-            distanceCM = Ultrasonic_ReadDistance();
-
-            if (distanceCM > 0.0f &&
-                distanceCM < OBSTACLE_LIMIT_CM)
-            {
-                if (!obstacleDetected)
-                {
-                    obstacleDetected = 1;
-
-                    char message[60];
-
-                    snprintf(message,
-                             sizeof(message),
-                             "OBSTACLE DETECTED: %.1f CM\r\n",
-                             distanceCM);
-
-                    Bluetooth_Send(message);
-                }
-            }
-            else
-            {
-                if (obstacleDetected)
-                {
-                    obstacleDetected = 0;
-
-                    Bluetooth_Send("OBSTACLE CLEARED\r\n");
-                }
-            }
-        }
-
-        /* ------------------------------------------------
-           3. MOTOR CONTROL
-           ------------------------------------------------ */
-
-        Motor_Update();
-
-        /* ------------------------------------------------
-           4. EMERGENCY BUTTON
-           ------------------------------------------------ */
-
-        Button_Process();
+/**
+  * @brief  Transmits a null-terminated string over USART2 (HC-05).
+  */
+void UART2_SendString(const char *str) {
+    while (*str) {
+        UART2_SendChar(*str++);
     }
 }
 
-/* GPS FUNCTIONS -------------------------------------------------------------*/
-
-static void GPS_StartReception(void)
-{
-    if (HAL_UART_Receive_IT(&huart1, &gpsRxByte, 1) != HAL_OK)
-    {
-        Error_Handler();
-    }
+/**
+  * @brief  Transmits a 2-digit decimal number (00..99) over USART2.
+  */
+void UART2_Send2DigitNum(uint32_t num) {
+    uint8_t tens = (uint8_t)(num / 10);
+    uint8_t units = (uint8_t)(num % 10);
+    UART2_SendChar((char)('0' + tens));
+    UART2_SendChar((char)('0' + units));
 }
 
-/* GPS UART interrupt callback */
+/* ---------------------------------------------------------------------------*/
+/* GPS NMEA RMC Sentence Parser                                               */
+/* ---------------------------------------------------------------------------*/
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1)
-    {
-        char received = (char)gpsRxByte;
+/**
+  * @brief  Validates and parses $GPRMC / $GNRMC sentences.
+  *         Extracts Fix Status, Latitude, N/S, Longitude, and E/W pointers.
+  * @param  line: Null-terminated NMEA sentence string.
+  * @retval true if valid RMC sentence parsed, false otherwise.
+  */
+bool Parse_RMC(char *line) {
+    /* Verify sentence starts with '$', has 'R', 'M', 'C' at indices 3, 4, 5 */
+    if (line[0] != '$' || line[3] != 'R' || line[4] != 'M' || line[5] != 'C') {
+        return false;
+    }
 
-        if (!gpsLineReady)
-        {
-            if (received == '\n')
-            {
-                gpsBuffer[gpsIndex] = '\0';
+    uint32_t comma_count = 0;
+    char *p = line;
 
-                gpsLineReady = 1;
-            }
-            else if (received != '\r')
-            {
-                if (gpsIndex < GPS_BUFFER_SIZE - 1)
-                {
-                    gpsBuffer[gpsIndex++] = received;
-                }
-                else
-                {
-                    gpsIndex = 0;
-                }
+    while (*p != '\0') {
+        if (*p == ',') {
+            comma_count++;
+            switch (comma_count) {
+                case 2:
+                    /* Comma 2: Status character follows ('A' = Valid, 'V' = Warning) */
+                    gps_status = *(p + 1);
+                    break;
+
+                case 3:
+                    /* Comma 3: Start of Latitude field */
+                    ptr_lat = p + 1;
+                    break;
+
+                case 4:
+                    /* Comma 4: Null-terminate Lat string, read N/S */
+                    *p = '\0';
+                    ns_char = *(p + 1);
+                    break;
+
+                case 5:
+                    /* Comma 5: Start of Longitude field */
+                    ptr_lon = p + 1;
+                    break;
+
+                case 6:
+                    /* Comma 6: Null-terminate Lon string, read E/W */
+                    *p = '\0';
+                    ew_char = *(p + 1);
+                    break;
+
+                case 7:
+                    /* Finished extracting essential coordinates */
+                    return true;
+
+                default:
+                    break;
             }
         }
+        p++;
+    }
 
-        HAL_UART_Receive_IT(&huart1, &gpsRxByte, 1);
+    return (comma_count >= 6);
+}
+
+/**
+  * @brief  Formats and transmits the parsed GPS location over HC-05.
+  */
+void Send_Parsed_GPS(void) {
+    /* If emergency is active, send emergency header */
+    if (emergency_state != EMERGENCY_STATE_NORMAL) {
+        UART2_SendString(STR_SOS_PREFIX);
+    }
+
+    /* Check if satellite fix is valid ('A') */
+    if (gps_status == 'A' && ptr_lat != NULL && ptr_lon != NULL) {
+        UART2_SendString("Lat: ");
+        UART2_SendString(ptr_lat);
+        UART2_SendChar(' ');
+        UART2_SendChar(ns_char);
+
+        UART2_SendString(", Lon: ");
+        UART2_SendString(ptr_lon);
+        UART2_SendChar(' ');
+        UART2_SendChar(ew_char);
+
+        UART2_SendChar('\r');
+        UART2_SendChar('\n');
+    } else {
+        UART2_SendString(STR_SEARCHING);
     }
 }
 
-/* Convert GPS coordinate to decimal degrees */
+/* ---------------------------------------------------------------------------*/
+/* Emergency SOS Button State Machine (Universal Latching & Momentary Engine) */
+/* ---------------------------------------------------------------------------*/
 
-static float GPS_ConvertToDecimal(double coordinate, char direction)
-{
-    int degrees = (int)(coordinate / 100.0);
-
-    double minutes = coordinate - (degrees * 100.0);
-
-    float decimal = degrees + (minutes / 60.0);
-
-    if (direction == 'S' || direction == 'W')
-    {
-        decimal = -decimal;
+/**
+  * @brief  Evaluates PB1 emergency button with debounce, supporting both
+  *         latching toggle switches and momentary push buttons.
+  */
+void Process_Emergency_Button(void) {
+    if (btn_debounce_timer > 0) {
+        return; /* In debounce cooldown */
     }
 
-    return decimal;
+    /* Read current PB1 level */
+    uint32_t current_level = (GPIOB->IDR >> 1) & 0x01;
+
+    if (current_level == last_btn_level) {
+        return; /* Level has not changed */
+    }
+
+    /* State changed! Record new level and set 50ms debounce */
+    last_btn_level = current_level;
+    btn_debounce_timer = BTN_DEBOUNCE_MS;
+
+    /* Determine transition direction */
+    if (current_level != btn_idle_level) {
+        /* ===================================================================
+         * TRANSITION: IDLE -> ACTIVE (Button Pressed / Latched Active)
+         * =================================================================== */
+        btn_press_duration = 0;
+
+        if (emergency_state == EMERGENCY_STATE_NORMAL) {
+            /* PUSH 1: TRIGGER EMERGENCY! */
+            emergency_state = EMERGENCY_STATE_PENDING;
+            emergency_timer_ms = 0;
+
+            UART2_SendString(STR_SOS_BANNER);
+
+            /* Force immediate GPS reading and transmission */
+            gps_timer = GPS_STREAM_INTERVAL;
+            gps_state = GPS_STATE_WAIT_DOLLAR;
+        }
+        else if (emergency_state == EMERGENCY_STATE_PENDING) {
+            /* 2ND PUSH WITHIN 5 SECONDS -> FALSE ALARM! */
+            emergency_state = EMERGENCY_STATE_NORMAL;
+            emergency_timer_ms = 0;
+
+            UART2_SendString(STR_FALSE_ALARM);
+        }
+        else if (emergency_state == EMERGENCY_STATE_CONFIRMED) {
+            /* 2ND PUSH AFTER 5 SECONDS -> EMERGENCY CLEARED! */
+            emergency_state = EMERGENCY_STATE_NORMAL;
+            emergency_timer_ms = 0;
+
+            UART2_SendString(STR_SOS_CLEARED);
+        }
+    } else {
+        /* ===================================================================
+         * TRANSITION: ACTIVE -> IDLE (Button Released / Latched Normal)
+         * =================================================================== */
+        if (btn_press_duration < MOMENTARY_HOLD_MIN_MS) {
+            /* Quick finger release (<350ms) on a momentary button -> Ignore release! */
+            return;
+        }
+
+        /* Latching button stayed active for >= 350ms and now unlatched (2nd Press) */
+        if (emergency_state == EMERGENCY_STATE_PENDING) {
+            emergency_state = EMERGENCY_STATE_NORMAL;
+            emergency_timer_ms = 0;
+            UART2_SendString(STR_FALSE_ALARM);
+        }
+        else if (emergency_state == EMERGENCY_STATE_CONFIRMED) {
+            emergency_state = EMERGENCY_STATE_NORMAL;
+            emergency_timer_ms = 0;
+            UART2_SendString(STR_SOS_CLEARED);
+        }
+    }
 }
 
-/* Parse GPS GGA sentence */
+/* ---------------------------------------------------------------------------*/
+/* GPS Serial Stream Handler                                                  */
+/* ---------------------------------------------------------------------------*/
 
-static void GPS_ProcessLine(char *line)
-{
-    char *gga = strstr(line, "GGA,");
+/**
+  * @brief  Consumes incoming GPS bytes from USART1 DR and executes state machine.
+  */
+void Process_GPS_Byte(uint8_t byte) {
+    if (gps_state == GPS_STATE_IDLE) {
+        return; /* Discard bytes when idle */
+    }
 
-    if (gga == NULL)
-    {
+    if (gps_state == GPS_STATE_WAIT_DOLLAR) {
+        if (byte == '$') {
+            gps_state = GPS_STATE_BUFFERING;
+            line_buf_idx = 0;
+            line_buf[line_buf_idx++] = '$';
+        }
         return;
     }
 
-    gga += 4;
-
-    double rawLatitude;
-    double rawLongitude;
-
-    char northSouth;
-    char eastWest;
-
-    int fixQuality;
-
-    int result = sscanf(gga,
-                        "%*[^,],%lf,%c,%lf,%c,%d",
-                        &rawLatitude,
-                        &northSouth,
-                        &rawLongitude,
-                        &eastWest,
-                        &fixQuality);
-
-    if (result == 5 && fixQuality > 0)
-    {
-        latitude = GPS_ConvertToDecimal(rawLatitude, northSouth);
-
-        longitude = GPS_ConvertToDecimal(rawLongitude, eastWest);
-
-        gpsFix = 1;
-    }
-    else
-    {
-        gpsFix = 0;
-    }
-}
-
-/* ULTRASONIC SENSOR ---------------------------------------------------------*/
-
-static float Ultrasonic_ReadDistance(void)
-{
-    uint32_t startTime;
-    uint32_t timeout;
-
-    uint16_t pulseStart;
-    uint16_t pulseEnd;
-    uint16_t pulseWidth;
-
-    /* Trigger LOW */
-
-    TRIG_LOW();
-
-    /* Wait approximately 2 microseconds */
-
-    startTime = __HAL_TIM_GET_COUNTER(&htim2);
-
-    while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim2) -
-                      startTime) < 2)
-    {
-    }
-
-    /* Generate 10 microsecond pulse */
-
-    TRIG_HIGH();
-
-    startTime = __HAL_TIM_GET_COUNTER(&htim2);
-
-    while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim2) -
-                      startTime) < 10)
-    {
-    }
-
-    TRIG_LOW();
-
-    /* Wait for ECHO HIGH */
-
-    timeout = HAL_GetTick();
-
-    while (HAL_GPIO_ReadPin(ECHO_GPIO_Port,
-                            ECHO_Pin) == GPIO_PIN_RESET)
-    {
-        if ((HAL_GetTick() - timeout) > ULTRASONIC_TIMEOUT_MS)
-        {
-            return -1.0f;
-        }
-    }
-
-    /* Measure pulse width */
-
-    pulseStart = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
-
-    while (HAL_GPIO_ReadPin(ECHO_GPIO_Port,
-                            ECHO_Pin) == GPIO_PIN_SET)
-    {
-        if ((HAL_GetTick() - timeout) > ULTRASONIC_TIMEOUT_MS)
-        {
-            return -1.0f;
-        }
-    }
-
-    pulseEnd = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
-
-    pulseWidth = (uint16_t)(pulseEnd - pulseStart);
-
-    /* Convert microseconds to centimeters */
-
-    return (float)pulseWidth / 58.0f;
-}
-
-/* MOTOR CONTROL -------------------------------------------------------------*/
-
-static void Motor_Update(void)
-{
-    uint32_t currentTime = HAL_GetTick();
-
-    if (obstacleDetected)
-    {
-        if (!motorState &&
-            (currentTime - motorTimer >= MOTOR_OFF_TIME_MS))
-        {
-            MOTOR_ON();
-
-            motorState = 1;
-
-            motorTimer = currentTime;
+    if (gps_state == GPS_STATE_BUFFERING) {
+        if (line_buf_idx < (sizeof(line_buf) - 2)) {
+            line_buf[line_buf_idx++] = (char)byte;
+        } else {
+            /* Buffer overflow prevention: reset to idle */
+            gps_state = GPS_STATE_IDLE;
+            return;
         }
 
-        if (motorState &&
-            (currentTime - motorTimer >= MOTOR_ON_TIME_MS))
-        {
-            MOTOR_OFF();
+        if (byte == '\n') {
+            line_buf[line_buf_idx] = '\0'; /* Null-terminate */
 
-            motorState = 0;
-
-            motorTimer = currentTime;
-        }
-    }
-    else
-    {
-        MOTOR_OFF();
-
-        motorState = 0;
-
-        motorTimer = currentTime;
-    }
-}
-
-/* EMERGENCY BUTTON ----------------------------------------------------------*/
-
-static void Button_Process(void)
-{
-    uint8_t reading =
-        (uint8_t)HAL_GPIO_ReadPin(BUTTON_GPIO_Port, BUTTON_Pin);
-
-    uint32_t currentTime = HAL_GetTick();
-
-    if (reading != buttonLastReading)
-    {
-        buttonDebounceTimer = currentTime;
-
-        buttonLastReading = reading;
-    }
-
-    if ((currentTime - buttonDebounceTimer) >= BUTTON_DEBOUNCE_MS)
-    {
-        if (reading != buttonStableState)
-        {
-            buttonStableState = reading;
-
-            if (buttonStableState == GPIO_PIN_RESET)
-            {
-                Send_Emergency_Alert();
+            if (Parse_RMC(line_buf)) {
+                /* Successfully parsed $GPRMC / $GNRMC: Send formatted Lat/Lon */
+                Send_Parsed_GPS();
+                gps_state = GPS_STATE_IDLE; /* Done, rest until next 5s tick */
+            } else {
+                /* Not RMC: continue waiting for next sentence in the 1-second burst */
+                gps_state = GPS_STATE_WAIT_DOLLAR;
             }
         }
     }
 }
 
-/* BLUETOOTH FUNCTIONS -------------------------------------------------------*/
+/* ---------------------------------------------------------------------------*/
+/* SysTick Millisecond Timer Engine                                           */
+/* ---------------------------------------------------------------------------*/
 
-static void Bluetooth_Send(const char *message)
-{
-    HAL_UART_Transmit(&huart2,
-                      (uint8_t *)message,
-                      strlen(message),
-                      500);
-}
-
-/* Send GPS location through Bluetooth */
-
-static void Send_GPS_Location(const char *alert)
-{
-    char message[160];
-
-    if (gpsFix)
-    {
-        snprintf(message,
-                 sizeof(message),
-                 "%s\r\nLatitude: %.6f\r\nLongitude: %.6f\r\n",
-                 alert,
-                 latitude,
-                 longitude);
-    }
-    else
-    {
-        snprintf(message,
-                 sizeof(message),
-                 "%s\r\nGPS FIX NOT AVAILABLE\r\n",
-                 alert);
+/**
+  * @brief  Polls the SysTick COUNTFLAG (bit 16). When 1ms has elapsed,
+  *         updates all software timers, emergency countdown, and LED.
+  */
+void Process_SysTick(void) {
+    if (!(SysTick->CTRL & (1 << 16))) {
+        return; /* 1ms has not yet elapsed */
     }
 
-    Bluetooth_Send(message);
-}
+    ms_counter++;
+    gps_timer++;
+    ultrasonic_timer++;
+    alert_cooldown++;
+    btn_press_duration++;
 
-/* Emergency button alert */
-
-static void Send_Emergency_Alert(void)
-{
-    MOTOR_ON();
-
-    Send_GPS_Location("EMERGENCY BUTTON PRESSED!");
-
-    HAL_Delay(200);
-
-    MOTOR_OFF();
-}
-
-/* SYSTEM CLOCK CONFIGURATION -----------------------------------------------*/
-
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-
-    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-
-    RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-
-    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-
-    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    {
-        Error_Handler();
+    if (btn_debounce_timer > 0) {
+        btn_debounce_timer--;
     }
 
-    RCC_ClkInitStruct.ClockType =
-        RCC_CLOCKTYPE_HCLK |
-        RCC_CLOCKTYPE_SYSCLK |
-        RCC_CLOCKTYPE_PCLK1 |
-        RCC_CLOCKTYPE_PCLK2;
+    /* Handle 5-second Emergency Confirmation Countdown */
+    if (emergency_state == EMERGENCY_STATE_PENDING) {
+        emergency_timer_ms++;
+        if (emergency_timer_ms >= SOS_CANCEL_WINDOW_MS) {
+            /* 5 SECONDS REACHED WITHOUT CANCELLATION -> CONFIRMED EMERGENCY! */
+            emergency_state = EMERGENCY_STATE_CONFIRMED;
+            UART2_SendString(STR_SOS_CONFIRMED);
+        }
+    }
 
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    /* Handle PC13 Status LED */
+    if (emergency_state != EMERGENCY_STATE_NORMAL) {
+        /* Emergency Active: Rapid Strobe (Toggle every ~128ms via bit 7) */
+        if (ms_counter & 0x80) {
+            GPIOC->BSRR = (1 << 29); /* BR13: LED ON */
+        } else {
+            GPIOC->BSRR = (1 << 13); /* BS13: LED OFF */
+        }
+    }
 
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct,
-                            FLASH_LATENCY_2) != HAL_OK)
-    {
-        Error_Handler();
+    /* Check GPS 5-Second Trigger */
+    if (gps_timer >= GPS_STREAM_INTERVAL) {
+        gps_timer = 0;
+        if (gps_state == GPS_STATE_IDLE) {
+            gps_state = GPS_STATE_WAIT_DOLLAR; /* Arm capture of next NMEA sentence */
+        }
     }
 }
 
-/* ERROR HANDLER -------------------------------------------------------------*/
+/* ---------------------------------------------------------------------------*/
+/* HC-SR04 Ultrasonic Distance Sensor Engine                                  */
+/* ---------------------------------------------------------------------------*/
 
-void Error_Handler(void)
-{
-    __disable_irq();
+/**
+  * @brief  Performs non-blocking check and triggers HC-SR04 sensor every 100ms.
+  *         HALTED completely when an emergency is active.
+  */
+void Process_Ultrasonic(void) {
+    /* CRITICAL: HALT ULTRASONIC SENSOR WHILE IN EMERGENCY MODE! */
+    if (emergency_state != EMERGENCY_STATE_NORMAL) {
+        return;
+    }
 
-    while (1)
-    {
+    if (ultrasonic_timer < ULTRASONIC_INTERVAL) {
+        return;
+    }
+
+    ultrasonic_timer = 0;
+
+    /* 1. Generate 20us Trigger pulse on PA0 */
+    GPIOA->BSRR = (1 << 0); /* PA0 HIGH */
+    for (volatile int i = 0; i < 50; i++) { __NOP(); }
+    GPIOA->BRR = (1 << 0);  /* PA0 LOW */
+
+    /* 2. Wait for Echo (PA1) to go HIGH (Timeout ~35,000 iterations / ~25ms) */
+    uint32_t timeout = 35000;
+    while (!(GPIOA->IDR & (1 << 1))) {
+        if (--timeout == 0) {
+            distance_cm = 999; /* Echo never went high */
+            GPIOC->BSRR = (1 << 13); /* LED OFF */
+            return;
+        }
+    }
+
+    /* 3. Echo went HIGH: Start TIM2 (1us tick) */
+    TIM2->CNT = 0;
+    TIM2->CR1 = 1; /* CEN = 1 (Enable counter) */
+
+    /* 4. Wait for Echo (PA1) to go LOW (Timeout ~45,000 us) */
+    while (GPIOA->IDR & (1 << 1)) {
+        if (TIM2->CNT >= 45000) {
+            TIM2->CR1 = 0; /* Stop counter */
+            distance_cm = 999; /* Open-air timeout */
+            GPIOC->BSRR = (1 << 13); /* LED OFF */
+            return;
+        }
+    }
+
+    /* 5. Echo dropped LOW: Stop TIM2 and read pulse duration */
+    TIM2->CR1 = 0;
+    raw_echo_us = TIM2->CNT;
+
+    /* Ignore blind zone glitch (< 116 us / < 2 cm) */
+    if (raw_echo_us < 116) {
+        return;
+    }
+
+    /* Distance in cm = microseconds / 58 */
+    distance_cm = raw_echo_us / 58;
+
+    /* Check proximity threshold: 2 cm <= distance < 50 cm */
+    if (distance_cm >= DISTANCE_ALERT_MIN_CM && distance_cm < DISTANCE_ALERT_MAX_CM) {
+        /* Obstacle Detected: Turn PC13 LED ON (BR13) */
+        GPIOC->BSRR = (1 << 29);
+
+        /* Transmit obstacle alert if cooldown has expired (min 500ms) */
+        if (alert_cooldown >= ALERT_COOLDOWN) {
+            alert_cooldown = 0;
+            UART2_SendString(STR_ALERT_PRE);
+            UART2_Send2DigitNum(distance_cm);
+            UART2_SendString(STR_ALERT_POST);
+        }
+    } else {
+        /* Obstacle Cleared: Turn PC13 LED OFF (BS13) */
+        GPIOC->BSRR = (1 << 13);
     }
 }
 
-#ifdef USE_FULL_ASSERT
+/* ---------------------------------------------------------------------------*/
+/* Main Program Loop                                                          */
+/* ---------------------------------------------------------------------------*/
 
-void assert_failed(uint8_t *file, uint32_t line)
-{
-    /* User may add error reporting here */
+int main(void) {
+    /* Initialize clocks, GPIOs, SysTick, TIM2, and UARTs */
+    System_Init();
+
+    /* Infinite Superloop */
+    while (1) {
+        /* 1. Process Emergency SOS Button */
+        Process_Emergency_Button();
+
+        /* 2. Process Incoming GPS Byte if available */
+        if (USART1->SR & (1 << 5)) { /* RXNE (Read data register not empty) */
+            uint8_t rx_byte = (uint8_t)(USART1->DR & 0xFF);
+            Process_GPS_Byte(rx_byte);
+        }
+
+        /* 3. Process SysTick Timers and Countdowns */
+        Process_SysTick();
+
+        /* 4. Process Ultrasonic HC-SR04 Sensing (only in Normal Mode) */
+        Process_Ultrasonic();
+    }
 }
-
-#endif
