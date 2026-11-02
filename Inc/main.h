@@ -186,6 +186,7 @@ typedef enum {
 #define STR_SEARCHING     "GPS: Searching for Satellites... (No Lock)\r\n"
 
 /* Function Prototypes -------------------------------------------------------*/
+void Error_Handler(void);
 void System_Init(void);
 void UART2_SendChar(char c);
 void UART2_SendString(const char *str);

@@ -603,6 +603,14 @@ void Process_Ultrasonic(void) {
 /* Main Program Loop                                                          */
 /* ---------------------------------------------------------------------------*/
 
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1)
+    {
+    }
+}
+
 int main(void) {
     /* Initialize clocks, GPIOs, SysTick, TIM2, and UARTs */
     System_Init();
